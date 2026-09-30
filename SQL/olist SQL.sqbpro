@@ -1,0 +1,469 @@
+<?xml version="1.0" encoding="UTF-8"?><sqlb_project><db path="C:/Users/IT/Desktop/Olist/files/olist.db" readonly="0" foreign_keys="1" case_sensitive_like="0" temp_store="0" wal_autocheckpoint="1000" synchronous="2"/><attached/><window><main_tabs open="structure browser pragmas query" current="3"/></window><tab_structure><column_width id="0" width="300"/><column_width id="1" width="0"/><column_width id="2" width="100"/><column_width id="3" width="1905"/><column_width id="4" width="0"/><expanded_item id="0" parent="1"/><expanded_item id="1" parent="1"/><expanded_item id="2" parent="1"/><expanded_item id="3" parent="1"/></tab_structure><tab_browse><table title="olist_customers_dataset" custom_title="0" dock_id="1" table="4,23:mainolist_customers_dataset"/><dock_state state="000000ff00000000fd00000001000000020000000000000000fc0100000001fb000000160064006f0063006b00420072006f00770073006500310100000000ffffffff0000011800ffffff000000000000000000000004000000040000000800000008fc00000000"/><default_encoding codec=""/><browse_table_settings/></tab_browse><tab_sql><sql name="SQL 1*">-- ============================================================
+
+-- STEP 1: Duplicate check on order_reviews table
+
+-- Question: does every order have exactly one review, or are
+
+-- there duplicates that would inflate our review-score averages?
+
+-- ============================================================
+
+SELECT order_id, COUNT(*) as review_count
+
+FROM olist_order_reviews_dataset
+
+GROUP BY order_id
+
+HAVING COUNT(*) &gt; 1;
+
+-- Result: 555 orders have more than 1 review
+
+
+
+
+
+-- ============================================================
+
+-- STEP 2: Check how many orders have 3+ reviews (not just 2)
+
+-- Question: does the 555 vs. 559 mismatch (555 affected orders vs.
+
+-- 559 extra rows from 100,000 - 99,441) mean some orders have
+
+-- more than 2 reviews each?
+
+-- ============================================================
+
+SELECT order_id, COUNT(*) as review_count
+
+FROM olist_order_reviews_dataset
+
+GROUP BY order_id
+
+HAVING COUNT(*) &gt; 2;
+
+-- Result: 4 orders have exactly 3 reviews each.
+
+-- This reconciles the numbers: 551 orders x 1 extra row, plus
+
+-- 4 orders x 2 extra rows = 559 extra rows total (matches
+
+-- 100,000 raw rows - 99,441 unique orders).
+
+
+
+
+
+-- ============================================================
+
+-- STEP 3: De-duplicate reviews - keep only the most recent
+
+-- review per order_id (by review_answer_timestamp)
+
+-- Question: after removing duplicates this way, do we get back
+
+-- exactly 99,441 rows (one review per order, matching orders table)?
+
+-- ============================================================
+
+WITH ranked_reviews AS (
+
+    SELECT *,
+
+        ROW_NUMBER() OVER (
+
+            PARTITION BY order_id
+
+            ORDER BY review_answer_timestamp DESC
+
+        ) AS rn
+
+    FROM olist_order_reviews_dataset
+
+)
+
+SELECT COUNT(*) FROM ranked_reviews WHERE rn = 1;
+
+-- Result: 99,441 - confirms the de-duplication logic is correct
+
+-- and will be reused (as the clean_reviews CTE) in every query
+
+-- below that needs review_score.
+
+
+
+
+
+-- ============================================================
+
+-- Q1: What is the average customer review score in each state?
+
+-- Business question: which states report the lowest satisfaction,
+
+-- so we know where to prioritize logistics/seller intervention?
+
+-- ============================================================
+
+
+
+-- Step 1: Reviews table has 559 duplicate order_ids (some orders
+
+-- were reviewed more than once). We keep only the MOST RECENT
+
+-- review per order (by review_answer_timestamp) to avoid double-counting.
+
+WITH ranked_reviews AS (
+
+    SELECT *,
+
+        ROW_NUMBER() OVER (
+
+            PARTITION BY order_id
+
+            ORDER BY review_answer_timestamp DESC
+
+        ) AS rn
+
+    FROM olist_order_reviews_dataset
+
+),
+
+clean_reviews AS (
+
+    SELECT order_id, review_score
+
+    FROM ranked_reviews
+
+    WHERE rn = 1
+
+)
+
+
+
+-- Step 2: Join orders -&gt; customers (for state) -&gt; clean_reviews (for score)
+
+-- Filtered to 'delivered' orders only, since review reflects an actual
+
+-- delivery experience.
+
+SELECT
+
+    c.customer_state AS state,
+
+    COUNT(DISTINCT o.order_id) AS total_orders,
+
+    ROUND(AVG(r.review_score), 2) AS avg_review_score
+
+FROM olist_orders_dataset o
+
+JOIN olist_customers_dataset c ON o.customer_id = c.customer_id
+
+JOIN clean_reviews r ON o.order_id = r.order_id
+
+WHERE o.order_status = 'delivered'
+
+GROUP BY c.customer_state
+
+ORDER BY avg_review_score ASC;
+
+-- Result: 27 states. Worst 3: MA, AL, PA.
+
+
+
+
+
+-- ============================================================
+
+-- Q2: Which sellers have the highest average delivery delay?
+
+-- Business question: is delay caused by a handful of specific
+
+-- sellers we can target, or spread evenly across the marketplace?
+
+-- ============================================================
+
+-- Late definition: delivered DATE is after the estimated DATE.
+
+-- The estimate is a date (time = 00:00), so delivery on the promised
+
+-- day, at any hour, is on time. Only sellers with 10+ orders are ranked
+
+-- (avoids a seller with 1-2 unlucky orders distorting the ranking).
+
+SELECT
+
+    oi.seller_id,
+
+    s.seller_state,
+
+    COUNT(DISTINCT oi.order_id) AS orders_fulfilled,
+
+    ROUND(AVG(
+
+        JULIANDAY(DATE(o.order_delivered_customer_date)) - JULIANDAY(DATE(o.order_estimated_delivery_date))
+
+    ), 2) AS avg_delay_days,
+
+    ROUND(100.0 * SUM(
+
+        CASE WHEN DATE(o.order_delivered_customer_date) &gt; DATE(o.order_estimated_delivery_date)
+
+             THEN 1 ELSE 0 END
+
+    ) / COUNT(*), 2) AS pct_late
+
+FROM olist_order_items_dataset oi
+
+JOIN olist_orders_dataset o ON oi.order_id = o.order_id
+
+JOIN olist_sellers_dataset s ON oi.seller_id = s.seller_id
+
+WHERE o.order_status = 'delivered'
+
+  AND o.order_delivered_customer_date IS NOT NULL
+
+GROUP BY oi.seller_id, s.seller_state
+
+HAVING orders_fulfilled &gt;= 10
+
+ORDER BY avg_delay_days DESC
+
+LIMIT 20;
+
+-- Result: top seller = cb41bfbcbda0aea354a834ab222f9a59 (SP),
+
+-- 11 orders, 9.55 days avg delay, 36.36% late.
+
+
+
+
+
+-- ============================================================
+
+-- Q3: What % of orders were delivered late, by month?
+
+-- Business question: is the delay problem constant over time, or
+
+-- concentrated in specific months (seasonal or peak-demand spikes)?
+
+-- ============================================================
+
+-- Grouped by purchase month. Late = delivered DATE after estimated DATE.
+
+-- Early months with very few orders (e.g. 2016-09 = 1 order) stay in the
+
+-- table but must be ignored when interpreting &quot;worst month&quot;.
+
+SELECT
+
+    STRFTIME('%Y-%m', o.order_purchase_timestamp) AS order_month,
+
+    COUNT(*) AS total_delivered_orders,
+
+    SUM(
+
+        CASE WHEN DATE(o.order_delivered_customer_date) &gt; DATE(o.order_estimated_delivery_date)
+
+             THEN 1 ELSE 0 END
+
+    ) AS late_orders,
+
+    ROUND(100.0 * SUM(
+
+        CASE WHEN DATE(o.order_delivered_customer_date) &gt; DATE(o.order_estimated_delivery_date)
+
+             THEN 1 ELSE 0 END
+
+    ) / COUNT(*), 2) AS pct_late
+
+FROM olist_orders_dataset o
+
+WHERE o.order_status = 'delivered'
+
+  AND o.order_delivered_customer_date IS NOT NULL
+
+GROUP BY order_month
+
+ORDER BY order_month;
+
+
+
+
+
+-- ============================================================
+
+-- Q3b (interpretation view): Which months had the worst late-
+
+-- delivery rate, EXCLUDING months with too few orders to be
+
+-- statistically meaningful (early launch months like 2016-09
+
+-- had just 1 order, which produces misleading 100%/0% rates)?
+
+-- ============================================================
+
+SELECT
+
+    STRFTIME('%Y-%m', o.order_purchase_timestamp) AS order_month,
+
+    COUNT(*) AS total_delivered_orders,
+
+    SUM(
+
+        CASE WHEN DATE(o.order_delivered_customer_date) &gt; DATE(o.order_estimated_delivery_date)
+
+             THEN 1 ELSE 0 END
+
+    ) AS late_orders,
+
+    ROUND(100.0 * SUM(
+
+        CASE WHEN DATE(o.order_delivered_customer_date) &gt; DATE(o.order_estimated_delivery_date)
+
+             THEN 1 ELSE 0 END
+
+    ) / COUNT(*), 2) AS pct_late
+
+FROM olist_orders_dataset o
+
+WHERE o.order_status = 'delivered'
+
+  AND o.order_delivered_customer_date IS NOT NULL
+
+GROUP BY order_month
+
+HAVING total_delivered_orders &gt;= 30
+
+ORDER BY pct_late DESC
+
+LIMIT 5;
+
+-- Result: worst 3 (statistically meaningful) months:
+
+-- 2018-03 (18.96%), 2018-02 (14.13%), 2017-11 (12.40%).
+
+
+
+
+
+-- ============================================================
+
+-- Q4: Which product categories generate the most revenue?
+
+-- Business question: where is the money concentrated, so we know
+
+-- which categories matter most if we improve their delivery/seller
+
+-- performance first?
+
+-- ============================================================
+
+-- Join order_items (price per item) -&gt; products (category, in
+
+-- Portuguese) -&gt; category_translation (English name). LEFT JOIN on
+
+-- translation so we don't lose revenue for categories with no
+
+-- translation row. COALESCE falls back to the Portuguese name, or
+
+-- 'unknown' when the category itself is NULL (610 products).
+
+SELECT
+
+    COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS category,
+
+    COUNT(DISTINCT oi.order_id) AS orders,
+
+    ROUND(SUM(oi.price), 2) AS total_revenue,
+
+    ROUND(AVG(oi.price), 2) AS avg_item_price
+
+FROM olist_order_items_dataset oi
+
+JOIN olist_products_dataset p ON oi.product_id = p.product_id
+
+LEFT JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name
+
+GROUP BY category
+
+ORDER BY total_revenue DESC
+
+LIMIT 15;
+
+-- Result: top 3 = health_beauty, watches_gifts, bed_bath_table.
+
+
+
+
+
+-- ============================================================
+
+-- Q5: Do late deliveries correlate with lower review scores?
+
+-- Business question: is delay purely a logistics issue, or does it
+
+-- really damage customer satisfaction enough to justify prioritizing
+
+-- it over other issues?
+
+-- ============================================================
+
+-- Step 1: keep only the latest review per order (559 duplicate rows exist).
+
+WITH ranked_reviews AS (
+
+    SELECT *,
+
+        ROW_NUMBER() OVER (
+
+            PARTITION BY order_id
+
+            ORDER BY review_answer_timestamp DESC
+
+        ) AS rn
+
+    FROM olist_order_reviews_dataset
+
+),
+
+clean_reviews AS (
+
+    SELECT order_id, review_score
+
+    FROM ranked_reviews
+
+    WHERE rn = 1
+
+)
+
+-- Step 2: split delivered orders into Late vs On Time (date-based)
+
+-- and compare average score and % of 1-2 star reviews.
+
+SELECT
+
+    CASE WHEN DATE(o.order_delivered_customer_date) &gt; DATE(o.order_estimated_delivery_date)
+
+         THEN 'Late' ELSE 'On Time' END AS delivery_status,
+
+    COUNT(*) AS orders,
+
+    ROUND(AVG(r.review_score), 3) AS avg_review_score,
+
+    SUM(CASE WHEN r.review_score &lt;= 2 THEN 1 ELSE 0 END) AS one_two_star_reviews,
+
+    ROUND(100.0 * SUM(CASE WHEN r.review_score &lt;= 2 THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_low_reviews
+
+FROM olist_orders_dataset o
+
+JOIN clean_reviews r ON o.order_id = r.order_id
+
+WHERE o.order_status = 'delivered'
+
+  AND o.order_delivered_customer_date IS NOT NULL
+
+GROUP BY delivery_status;
+
+-- Result: Late = 6,534 orders, avg 2.255, 62.87% low reviews.
+
+--         On Time = 89,936 orders, avg 4.279, 9.54% low reviews.</sql><current_tab id="0"/></tab_sql></sqlb_project>
